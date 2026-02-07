@@ -29,6 +29,7 @@ from chunker import DocumentChunker
 from embedder import Embedder
 from retriever import SemanticRetriever
 from prompts import get_messages_for_llm, format_retrieval_results
+# from query_decomposer import decompose_if_needed  # V7: disabled, caused regression
 
 load_dotenv()
 
@@ -78,6 +79,15 @@ class RAGPipeline:
         self.embedder = Embedder(model_name=embedding_model, cache_dir="embeddings")
         self.retriever = SemanticRetriever(embedder=self.embedder, chunker=self.chunker)
 
+        # Cross-encoder reranker (V8)
+        try:
+            from sentence_transformers import CrossEncoder
+            self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+            print("  - Reranker: cross-encoder/ms-marco-MiniLM-L-6-v2")
+        except Exception as e:
+            print(f"  - Reranker: disabled ({e})")
+            self.reranker = None
+
         print(f"RAG Pipeline initialized with:")
         print(f"  - Top-k retrieval: {top_k}")
         print(f"  - Max context: {max_context_length} chars")
@@ -125,12 +135,38 @@ class RAGPipeline:
             print(f"  Created {num_chunks} chunks")
 
         # Step 3: Retrieve relevant chunks
-        results = self.retriever.retrieve(question, top_k=self.top_k)
+        if self.reranker:
+            # Over-fetch for reranking, then blend scores
+            fetch_k = self.top_k * 3
+            results = self.retriever.retrieve(question, top_k=fetch_k)
+
+            if verbose:
+                print(f"  Reranking {len(results)} candidates...")
+
+            # Compute cross-encoder scores
+            pairs = [(question, r.chunk.text) for r in results]
+            rerank_scores = self.reranker.predict(pairs)
+
+            # Normalize both scores to [0,1] for blending
+            bi_scores = [r.score for r in results]
+            bi_min, bi_max = min(bi_scores), max(bi_scores)
+            ce_min, ce_max = float(min(rerank_scores)), float(max(rerank_scores))
+
+            for i, r in enumerate(results):
+                bi_norm = (r.score - bi_min) / (bi_max - bi_min + 1e-8)
+                ce_norm = (float(rerank_scores[i]) - ce_min) / (ce_max - ce_min + 1e-8)
+                # Blend: 60% bi-encoder + 40% cross-encoder
+                r.score = 0.6 * bi_norm + 0.4 * ce_norm
+
+            results.sort(key=lambda x: x.score, reverse=True)
+            results = results[:self.top_k]
+        else:
+            results = self.retriever.retrieve(question, top_k=self.top_k)
 
         if verbose:
             print(f"  Retrieved {len(results)} relevant chunks")
 
-        # Step 4: Format context
+        # Step 5: Format context
         context = format_retrieval_results(results, self.max_context_length)
 
         return context, results
