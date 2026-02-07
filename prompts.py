@@ -97,23 +97,16 @@ NUMERICAL_REASONING_TEMPLATE = """You are an expert at numerical and temporal re
 === INSTRUCTIONS ===
 This question requires numerical or date-based reasoning.
 
-Step 1 - Extract Data:
-List ALL relevant numbers, dates, years, ages, or quantities from the context.
-Format: [Entity]: [Value]
+First, extract the key data points from the context:
+- List the relevant numbers, dates, or quantities with their entities
 
-Step 2 - Identify Operation:
-What calculation is needed? (subtraction for age/difference, addition for totals, comparison for rankings)
+Then, perform the calculation:
+- Show the arithmetic step by step
+- Double-check your math
 
-Step 3 - Calculate:
-Show the arithmetic clearly:
-- If comparing dates: Later year - Earlier year = Difference
-- If calculating age: Death year - Birth year = Age
-- If summing: Value1 + Value2 + ... = Total
+Finally, state your FINAL ANSWER clearly as a specific value.
 
-Step 4 - Final Answer:
-State the answer as a specific value (number, date, name, etc.)
-
-=== SOLUTION ===
+=== REASONING ===
 """
 
 
