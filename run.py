@@ -51,8 +51,8 @@ class RAGPipeline:
         self,
         cache_dir: str = "cache",
         embedding_model: str = "BAAI/bge-small-en-v1.5",
-        top_k: int = 10,
-        max_context_length: int = 7000
+        top_k: int = 8,
+        max_context_length: int = 6000
     ):
         """
         Initialize the RAG pipeline

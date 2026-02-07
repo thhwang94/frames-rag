@@ -117,35 +117,6 @@ State the answer as a specific value (number, date, name, etc.)
 """
 
 
-# Prompt for tabular/list reasoning
-TABULAR_REASONING_TEMPLATE = """You are an expert at analyzing structured data and lists.
-
-=== WIKIPEDIA CONTEXT ===
-{context}
-
-=== QUESTION ===
-{question}
-
-=== INSTRUCTIONS ===
-This question requires analyzing structured information (lists, rankings, statistics, records).
-
-Step 1 - Identify the Data Structure:
-What type of data is being asked about? (rankings, statistics, records, lists)
-
-Step 2 - Extract Relevant Entries:
-List the specific items/entries that relate to the question.
-Format each as: [Item]: [Relevant Value/Attribute]
-
-Step 3 - Apply the Constraint:
-Filter or compare based on what the question asks (highest, lowest, first, most, etc.)
-
-Step 4 - Final Answer:
-State the specific answer (name, number, title, etc.)
-
-=== ANALYSIS ===
-"""
-
-
 def format_context(
     chunks: List[dict],
     max_length: int = 4000,
@@ -236,8 +207,7 @@ def generate_prompt(
         "cot": COT_PROMPT_TEMPLATE,
         "simple": SIMPLE_PROMPT_TEMPLATE,
         "detailed": DETAILED_COT_TEMPLATE,
-        "numerical": NUMERICAL_REASONING_TEMPLATE,
-        "tabular": TABULAR_REASONING_TEMPLATE
+        "numerical": NUMERICAL_REASONING_TEMPLATE
     }
 
     template = templates.get(prompt_type, COT_PROMPT_TEMPLATE)
@@ -252,29 +222,16 @@ def detect_question_type(question: str) -> str:
         question: The question text
 
     Returns:
-        Question type: "numerical", "tabular", "detailed", or "cot"
+        Question type: "numerical", "detailed", or "cot"
     """
     question_lower = question.lower()
-
-    # Tabular/ranking indicators (check first as these often overlap with numerical)
-    tabular_keywords = [
-        "ranking", "ranked", "top", "highest", "lowest", "most", "least",
-        "record", "statistics", "stat", "score", "scored",
-        "championship", "winner", "won", "award", "awards",
-        "list", "all the", "which team", "which player",
-        "premier league", "world cup", "olympic", "season"
-    ]
-
-    for keyword in tabular_keywords:
-        if keyword in question_lower:
-            return "tabular"
 
     # Numerical indicators
     numerical_keywords = [
         "how many", "how much", "how old", "how long", "how far",
         "what year", "when was", "when did", "what date",
         "calculate", "total", "sum", "difference", "between",
-        "older", "younger", "before", "after", "years"
+        "older", "younger", "before", "after", "first", "last"
     ]
 
     for keyword in numerical_keywords:
