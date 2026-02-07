@@ -83,39 +83,6 @@ class RAGPipeline:
         print(f"  - Max context: {max_context_length} chars")
         print(f"  - Embedding model: {embedding_model}")
 
-    def _extract_key_terms(self, question: str) -> List[str]:
-        """
-        Extract key terms from question for enhanced retrieval
-        Focus on proper nouns, numbers, and specific entities
-        """
-        import re
-
-        # Remove common question words
-        stop_patterns = [
-            r'\b(what|which|who|when|where|how|why|is|are|was|were|did|does|do)\b',
-            r'\b(the|a|an|of|in|on|at|to|for|with|by|from|as|and|or)\b',
-            r'\b(this|that|these|those|it|its|they|their|he|she|his|her)\b',
-            r'\?|,|\.'
-        ]
-
-        cleaned = question.lower()
-        for pattern in stop_patterns:
-            cleaned = re.sub(pattern, ' ', cleaned, flags=re.IGNORECASE)
-
-        # Extract potential key terms (2+ chars, not just numbers)
-        terms = [t.strip() for t in cleaned.split() if len(t.strip()) > 2]
-
-        # Also extract capitalized words from original (likely proper nouns)
-        proper_nouns = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', question)
-
-        # Extract years and numbers
-        numbers = re.findall(r'\b\d{4}\b|\b\d+(?:st|nd|rd|th)?\b', question)
-
-        # Combine unique terms
-        all_terms = list(set(terms + [p.lower() for p in proper_nouns] + numbers))
-
-        return all_terms[:10]  # Limit to top 10 terms
-
     def process_question(
         self,
         question: str,
@@ -157,23 +124,8 @@ class RAGPipeline:
         if verbose:
             print(f"  Created {num_chunks} chunks")
 
-        # Step 3: Enhanced retrieval with key terms
-        # First retrieve with original question
+        # Step 3: Retrieve relevant chunks
         results = self.retriever.retrieve(question, top_k=self.top_k)
-
-        # Extract key terms and do additional retrieval if needed
-        key_terms = self._extract_key_terms(question)
-        if key_terms and len(results) < self.top_k:
-            # Create enhanced query with key terms
-            enhanced_query = question + " " + " ".join(key_terms[:5])
-            additional_results = self.retriever.retrieve(enhanced_query, top_k=self.top_k // 2)
-
-            # Merge results, avoiding duplicates
-            seen_indices = {r.chunk.chunk_index for r in results}
-            for r in additional_results:
-                if r.chunk.chunk_index not in seen_indices:
-                    results.append(r)
-                    seen_indices.add(r.chunk.chunk_index)
 
         if verbose:
             print(f"  Retrieved {len(results)} relevant chunks")
