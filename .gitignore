@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+
+# Environment
+.env
+
+# Cache
+cache/
+embeddings/
+
+# IDE
+.vscode/
+.idea/
+
+# Results (keep versioned ones)
+# evaluation_results_*.json
+
+# OS
+.DS_Store
+Thumbs.db

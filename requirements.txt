@@ -1,0 +1,9 @@
+datasets
+python-dotenv
+openai
+tqdm
+sentence-transformers
+beautifulsoup4
+requests
+numpy
+aiohttp
