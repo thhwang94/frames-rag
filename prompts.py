@@ -20,7 +20,8 @@ SYSTEM_PROMPT = """You are an expert research assistant skilled at multi-hop rea
 Your task is to answer questions by carefully analyzing information from multiple Wikipedia sources.
 Always base your answers on the provided context.
 Be precise and factual - provide specific names, numbers, dates, or values as your final answer.
-If asked for a calculation, show your work and give the exact result."""
+If asked for a calculation, show your work and give the exact result.
+IMPORTANT: Many questions require connecting facts from DIFFERENT sources. Read ALL sources carefully before answering."""
 
 
 # Chain-of-Thought prompt template
@@ -31,13 +32,14 @@ COT_PROMPT_TEMPLATE = """You are an expert at multi-hop reasoning and fact synth
 
 === INSTRUCTIONS ===
 Answer the question using ONLY the information provided above.
-Think step by step:
-1. Extract specific facts from each source that relate to the question
-2. Connect facts across sources to build your reasoning
-3. Perform any necessary calculations (dates, numbers, etc.)
-4. State your FINAL ANSWER clearly
 
-IMPORTANT: Your final answer must be specific and precise (e.g., exact names, numbers, dates).
+Step-by-step approach:
+1. Read ALL sources carefully - the answer often requires connecting facts from DIFFERENT sources
+2. For each source, extract the specific facts relevant to the question
+3. Identify how facts from different sources connect (e.g., person X from Source 1 appears in Source 3)
+4. Chain the connected facts to reach the answer
+5. If calculations are needed, show the math explicitly
+6. State your FINAL ANSWER clearly and precisely (exact name, number, date, etc.)
 
 === QUESTION ===
 {question}

@@ -52,8 +52,8 @@ class RAGPipeline:
         self,
         cache_dir: str = "cache",
         embedding_model: str = "BAAI/bge-small-en-v1.5",
-        top_k: int = 8,
-        max_context_length: int = 6000
+        top_k: int = 10,
+        max_context_length: int = 7500
     ):
         """
         Initialize the RAG pipeline
@@ -159,17 +159,59 @@ class RAGPipeline:
                 r.score = 0.6 * bi_norm + 0.4 * ce_norm
 
             results.sort(key=lambda x: x.score, reverse=True)
-            results = results[:self.top_k]
+
+            # Source-balanced selection for multi-hop coverage
+            results = self._source_balanced_select(results, self.top_k)
         else:
             results = self.retriever.retrieve(question, top_k=self.top_k)
 
         if verbose:
-            print(f"  Retrieved {len(results)} relevant chunks")
+            sources = set(r.chunk.source_url.split('/')[-1] for r in results)
+            print(f"  Retrieved {len(results)} chunks from {len(sources)} sources")
 
         # Step 5: Format context
         context = format_retrieval_results(results, self.max_context_length)
 
         return context, results
+
+    def _source_balanced_select(self, sorted_results: List, top_k: int) -> List:
+        """
+        Select top-k results ensuring source diversity for multi-hop QA.
+        Guarantees at least 1 chunk from each source article (if available).
+        """
+        from collections import defaultdict
+
+        if len(sorted_results) <= top_k:
+            return sorted_results
+
+        # Group by source
+        by_source = defaultdict(list)
+        for r in sorted_results:
+            by_source[r.chunk.source_url].append(r)
+
+        selected = []
+        selected_set = set()
+
+        # Phase 1: Take best chunk from each source (ensures multi-hop coverage)
+        for source_url in by_source:
+            best = by_source[source_url][0]  # Already sorted by score
+            selected.append(best)
+            selected_set.add(id(best))
+
+        # Phase 2: Fill remaining slots with top-scoring chunks
+        remaining = top_k - len(selected)
+        if remaining > 0:
+            for r in sorted_results:
+                if id(r) not in selected_set:
+                    selected.append(r)
+                    selected_set.add(id(r))
+                    remaining -= 1
+                    if remaining <= 0:
+                        break
+
+        # Sort final selection by score
+        selected.sort(key=lambda x: x.score, reverse=True)
+        return selected[:top_k]
 
     def get_prompt_messages(
         self,
