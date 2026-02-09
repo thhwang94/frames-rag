@@ -15,13 +15,33 @@ class PromptConfig:
     reasoning_style: str = "step_by_step"  # step_by_step, concise, detailed
 
 
+# Simplified prompts for reasoning models (gpt-5-mini, o-series)
+# Reasoning models do their own CoT internally; verbose scaffolding wastes reasoning tokens
+REASONING_MODEL_SYSTEM_PROMPT = """You are a research assistant answering questions using Wikipedia sources.
+Always provide a definitive answer. Never say "cannot be determined" -- use your best judgment combining the sources with general knowledge.
+Be precise: give specific names, numbers, or dates."""
+
+REASONING_MODEL_USER_TEMPLATE = """<sources>
+{context}
+</sources>
+
+<question>
+{question}
+</question>
+
+Answer using the sources above. If sources are incomplete, combine them with your knowledge.
+For calculations, show work and verify the arithmetic.
+End with "ANSWER: [your concise answer]"."""
+
+
 # System prompt for the LLM
 SYSTEM_PROMPT = """You are an expert research assistant skilled at multi-hop reasoning.
 Your task is to answer questions by carefully analyzing information from multiple Wikipedia sources.
 Always base your answers on the provided context.
 Be precise and factual - provide specific names, numbers, dates, or values as your final answer.
-If asked for a calculation, show your work and give the exact result.
-IMPORTANT: Many questions require connecting facts from DIFFERENT sources. Read ALL sources carefully before answering."""
+If asked for a calculation, show your work and give the exact result. Double-check arithmetic by recalculating.
+IMPORTANT: Many questions require connecting facts from DIFFERENT sources. Read ALL sources carefully before answering.
+IMPORTANT: Always provide your best answer. Never say you cannot determine the answer - use the sources combined with your knowledge."""
 
 
 # Chain-of-Thought prompt template
@@ -284,7 +304,8 @@ def create_rag_prompt(
 def get_messages_for_llm(
     question: str,
     retrieval_results: List,
-    max_context_length: int = 4000
+    max_context_length: int = 4000,
+    model: str = "gpt-4o-mini"
 ) -> List[dict]:
     """
     Get formatted messages list for OpenAI-compatible API
@@ -293,10 +314,12 @@ def get_messages_for_llm(
         question: The question to answer
         retrieval_results: List of RetrievalResult objects
         max_context_length: Maximum context length
+        model: Model name (affects prompt style for reasoning models)
 
     Returns:
         List of message dictionaries for API call
     """
+    # Use same CoT prompts for all models (reasoning model simplified prompts caused regression)
     system_prompt, user_prompt = create_rag_prompt(
         question, retrieval_results, max_context_length
     )

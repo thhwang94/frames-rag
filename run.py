@@ -15,6 +15,11 @@ Implements a complete RAG pipeline:
 import ast
 import json
 import os
+import re
+import threading
+import queue
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 import argparse
 
@@ -28,6 +33,7 @@ from wikipedia_fetcher import WikipediaFetcher
 from chunker import DocumentChunker
 from embedder import Embedder
 from retriever import SemanticRetriever
+from embedder import Embedder
 from prompts import get_messages_for_llm, format_retrieval_results
 # from query_decomposer import decompose_if_needed  # V7: disabled, caused regression
 
@@ -217,7 +223,8 @@ class RAGPipeline:
         self,
         question: str,
         wiki_links: List[str],
-        verbose: bool = False
+        verbose: bool = False,
+        model: str = "gpt-4o-mini"
     ) -> List[Dict]:
         """
         Get formatted messages for LLM API call
@@ -226,6 +233,7 @@ class RAGPipeline:
             question: The question to answer
             wiki_links: List of Wikipedia article URLs
             verbose: Whether to print debug info
+            model: Model name (affects prompt style)
 
         Returns:
             List of message dictionaries for API call
@@ -239,7 +247,7 @@ class RAGPipeline:
                 {"role": "user", "content": f"Question: {question}\n\nNote: No Wikipedia content was available. Please answer based on your knowledge, or state if you cannot answer."}
             ]
 
-        return get_messages_for_llm(question, results, self.max_context_length)
+        return get_messages_for_llm(question, results, self.max_context_length, model)
 
 
 # Global RAG pipeline instance
@@ -269,6 +277,18 @@ def save_result(filename: str, result: Dict):
         json.dump(results, f, indent=2)
 
 
+_file_lock = threading.Lock()
+
+
+def save_result_threadsafe(filename: str, result: Dict):
+    """Thread-safe version of save_result using file lock"""
+    with _file_lock:
+        results = load_existing_results(filename)
+        results.append(result)
+        with open(filename, "w") as f:
+            json.dump(results, f, indent=2)
+
+
 def get_last_processed_index(results: List[Dict]) -> int:
     if not results:
         return -1
@@ -286,13 +306,81 @@ def get_llm_response(messages: List[Dict], model: str) -> str:
     Returns:
         LLM response text
     """
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        max_tokens=1000,
-        temperature=0.3,  # Lower temperature for more factual responses
-    )
-    return response.choices[0].message.content.strip()
+    # gpt-5 / o-series use different API params
+    is_new_api = "gpt-5" in model or model.startswith("o")
+    kwargs = {
+        "model": model,
+        "messages": messages,
+        "max_completion_tokens" if is_new_api else "max_tokens": 2000 if is_new_api else 1000,
+    }
+    if not is_new_api:
+        kwargs["temperature"] = 0.3  # gpt-5 only supports default temperature
+    # Retry up to 2 times if empty response
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(**kwargs)
+            content = response.choices[0].message.content
+            if content and content.strip():
+                return content.strip()
+        except Exception as e:
+            if attempt == 2:
+                print(f"  LLM error (attempt {attempt+1}): {e}")
+
+    # Fallback to gpt-4o-mini if model returns empty
+    if is_new_api:
+        fallback = client.chat.completions.create(
+            model="gpt-4o-mini", messages=messages, max_tokens=1000, temperature=0.3
+        )
+        content = fallback.choices[0].message.content
+        return content.strip() if content else ""
+    return ""
+
+
+def extract_final_answer(response: str) -> str:
+    """Extract the concise final answer from a response."""
+    # Try "ANSWER: ..." pattern
+    match = re.search(r'ANSWER:\s*(.+?)(?:\n|$)', response, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    # Try "FINAL ANSWER: ..." pattern
+    match = re.search(r'FINAL ANSWER:\s*(.+?)(?:\n|$)', response, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    # Fallback: last non-empty line
+    lines = [l.strip() for l in response.strip().split('\n') if l.strip()]
+    return lines[-1] if lines else response
+
+
+def get_llm_response_with_voting(messages: List[Dict], model: str, n: int = 3) -> str:
+    """
+    Generate n responses and return the one whose final answer
+    appears most frequently (majority vote).
+    Used for reasoning models where temperature=1.0 is forced.
+    """
+    responses = []
+    for _ in range(n):
+        resp = get_llm_response(messages, model)
+        if resp:
+            responses.append(resp)
+
+    if not responses:
+        return ""
+    if len(responses) == 1:
+        return responses[0]
+
+    # Extract and normalize final answers for voting
+    answers = [extract_final_answer(r) for r in responses]
+    normalized = [re.sub(r'[^\w\s]', '', a.lower()).strip() for a in answers]
+
+    counts = Counter(normalized)
+    winner_norm = counts.most_common(1)[0][0]
+
+    # Return the full response corresponding to the winning answer
+    for i, norm in enumerate(normalized):
+        if norm == winner_norm:
+            return responses[i]
+
+    return responses[0]
 
 
 def evaluate_response(
@@ -349,7 +437,75 @@ Please proceed with the evaluation."""
     return {"decision": decision, "explanation": explanation}
 
 
-def main(model: str, start: int = 0, end: int = 100, verbose: bool = False, version: str = ""):
+def create_worker_pipelines(base_pipeline: RAGPipeline, n: int) -> List[RAGPipeline]:
+    """
+    Create n worker pipelines with independent mutable state.
+    Shares: chunker (stateless), reranker model (read-only inference), embedder model (read-only inference)
+    Independent per worker: wiki_fetcher cache, embedder cache, retriever state
+    """
+    # Ensure the base embedder model is loaded before cloning
+    base_pipeline.embedder._get_model()
+
+    pipelines = []
+    for i in range(n):
+        wp = RAGPipeline.__new__(RAGPipeline)
+        wp.top_k = base_pipeline.top_k
+        wp.max_context_length = base_pipeline.max_context_length
+        wp.wiki_fetcher = WikipediaFetcher(cache_dir=base_pipeline.wiki_fetcher.cache_dir)
+        wp.chunker = base_pipeline.chunker  # shared, stateless
+
+        # Independent embedder with own cache dict, sharing the heavy model
+        worker_embedder = Embedder(
+            model_name=base_pipeline.embedder.model_name,
+            cache_dir=base_pipeline.embedder.cache_dir
+        )
+        worker_embedder.model = base_pipeline.embedder.model  # share loaded model
+        wp.embedder = worker_embedder
+
+        wp.reranker = base_pipeline.reranker  # shared, read-only inference
+        wp.retriever = SemanticRetriever(embedder=wp.embedder, chunker=wp.chunker)
+        pipelines.append(wp)
+    return pipelines
+
+
+def process_single_item(pipeline: RAGPipeline, item: Dict, model: str, verbose: bool) -> Dict:
+    """Process a single dataset item through the full RAG pipeline (thread-safe)"""
+    index = int(item["Unnamed: 0"])
+    question = item["Prompt"]
+    wiki_links_raw = item["wiki_links"]
+
+    if isinstance(wiki_links_raw, str):
+        try:
+            wiki_links = ast.literal_eval(wiki_links_raw)
+        except (ValueError, SyntaxError):
+            wiki_links = []
+    else:
+        wiki_links = wiki_links_raw if wiki_links_raw else []
+
+    if verbose:
+        print(f"\n[{index}] Processing: {question[:80]}...")
+
+    messages = pipeline.get_prompt_messages(question, wiki_links, verbose, model)
+    llm_response = get_llm_response(messages, model)
+    evaluation = evaluate_response(question, llm_response, item["Answer"])
+
+    result = {
+        "index": index,
+        "prompt": question,
+        "ground_truth": item["Answer"],
+        "llm_response": llm_response,
+        "evaluation_decision": evaluation["decision"],
+        "evaluation_explanation": evaluation["explanation"],
+        "reasoning_type": item["reasoning_types"],
+    }
+
+    if verbose:
+        print(f"  [{index}] Decision: {evaluation['decision']}")
+
+    return result
+
+
+def main(model: str, start: int = 0, end: int = 100, verbose: bool = False, version: str = "", workers: int = 1):
     """
     Main evaluation function
 
@@ -359,6 +515,7 @@ def main(model: str, start: int = 0, end: int = 100, verbose: bool = False, vers
         end: End index (exclusive)
         verbose: Whether to print detailed progress
         version: Version suffix for result file
+        workers: Number of concurrent workers (1=sequential)
     """
     # Initialize RAG pipeline
     rag_pipeline = get_rag_pipeline()
@@ -375,59 +532,63 @@ def main(model: str, start: int = 0, end: int = 100, verbose: bool = False, vers
     version_suffix = f"_{version}" if version else ""
     filename = f"evaluation_results_{model.replace('/', '_')}{version_suffix}.json"
     existing_results = load_existing_results(filename)
-    last_processed_index = get_last_processed_index(existing_results)
+
+    # Use set of processed indices for resume (supports out-of-order completion)
+    processed_indices = set(int(r.get("index", -1)) for r in existing_results)
+
+    # Filter out already-processed items
+    items_to_process = [
+        item for item in dataset
+        if int(item["Unnamed: 0"]) not in processed_indices
+    ]
 
     print(f"\nStarting evaluation:")
     print(f"  Model: {model}")
     print(f"  Range: {start}-{end}")
-    print(f"  Last processed: {last_processed_index}")
+    print(f"  Already processed: {len(processed_indices)}")
+    print(f"  Remaining: {len(items_to_process)}")
+    print(f"  Workers: {workers}")
     print(f"  Results file: {filename}\n")
 
-    for item in tqdm(dataset, desc="Processing samples"):
-        index = int(item["Unnamed: 0"])
-        if index <= last_processed_index:
-            continue
+    if not items_to_process:
+        print("All items already processed.")
+    elif workers <= 1:
+        # Sequential processing (original behavior)
+        for item in tqdm(items_to_process, desc="Processing samples"):
+            result = process_single_item(rag_pipeline, item, model, verbose)
+            save_result(filename, result)
+    else:
+        # Parallel processing with worker pipeline pool
+        print(f"Creating {workers} worker pipelines (sharing models)...")
+        worker_pipelines = create_worker_pipelines(rag_pipeline, workers)
 
-        question = item["Prompt"]
-        wiki_links_raw = item["wiki_links"]
+        # Pipeline pool: each worker thread checks out a pipeline, uses it, returns it
+        pipeline_pool = queue.Queue()
+        for wp in worker_pipelines:
+            pipeline_pool.put(wp)
 
-        # Parse wiki_links - it may be a string representation of a list
-        if isinstance(wiki_links_raw, str):
+        def process_with_pool(item):
+            pipeline = pipeline_pool.get()
             try:
-                wiki_links = ast.literal_eval(wiki_links_raw)
-            except (ValueError, SyntaxError):
-                wiki_links = []
-        else:
-            wiki_links = wiki_links_raw if wiki_links_raw else []
+                return process_single_item(pipeline, item, model, verbose)
+            finally:
+                pipeline_pool.put(pipeline)
 
-        if verbose:
-            print(f"\n[{index}] Processing question: {question[:80]}...")
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {}
+            for item in items_to_process:
+                future = executor.submit(process_with_pool, item)
+                futures[future] = int(item["Unnamed: 0"])
 
-        # Get RAG-enhanced prompt messages
-        messages = rag_pipeline.get_prompt_messages(question, wiki_links, verbose)
-
-        # Get LLM response
-        llm_response = get_llm_response(messages, model)
-
-        # Evaluate response
-        evaluation = evaluate_response(question, llm_response, item["Answer"])
-
-        result = {
-            "index": index,
-            "prompt": question,
-            "ground_truth": item["Answer"],
-            "llm_response": llm_response,
-            "evaluation_decision": evaluation["decision"],
-            "evaluation_explanation": evaluation["explanation"],
-            "reasoning_type": item["reasoning_types"],
-        }
-
-        save_result(filename, result)
-
-        if verbose:
-            print(f"  Answer: {llm_response[:100]}...")
-            print(f"  Ground truth: {item['Answer']}")
-            print(f"  Decision: {evaluation['decision']}")
+            with tqdm(total=len(futures), desc="Processing samples") as pbar:
+                for future in as_completed(futures):
+                    index = futures[future]
+                    try:
+                        result = future.result()
+                        save_result_threadsafe(filename, result)
+                    except Exception as e:
+                        print(f"\n  Error processing index {index}: {e}")
+                    pbar.update(1)
 
     # Calculate and print summary statistics
     results = load_existing_results(filename)
@@ -500,6 +661,12 @@ if __name__ == "__main__":
         default="",
         help="Version suffix for result file (e.g., v3)"
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of concurrent workers (default: 1, sequential)"
+    )
     args = parser.parse_args()
 
-    main(args.model, args.start, args.end, args.verbose, args.version)
+    main(args.model, args.start, args.end, args.verbose, args.version, args.workers)
