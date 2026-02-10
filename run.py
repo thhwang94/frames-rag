@@ -181,6 +181,21 @@ class RAGPipeline:
 
         return context, results
 
+    def _compute_bm25_scores(self, query: str, results: List) -> List[float]:
+        """Compute BM25 scores for retrieved chunks against the query."""
+        from rank_bm25 import BM25Okapi
+
+        # Tokenize chunks and query (simple whitespace + lowercasing)
+        chunk_texts = [r.chunk.text.lower().split() for r in results]
+        query_tokens = query.lower().split()
+
+        if not chunk_texts:
+            return []
+
+        bm25 = BM25Okapi(chunk_texts)
+        scores = bm25.get_scores(query_tokens)
+        return scores.tolist()
+
     def _source_balanced_select(self, sorted_results: List, top_k: int) -> List:
         """
         Select top-k results ensuring source diversity for multi-hop QA.
