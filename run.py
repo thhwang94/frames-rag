@@ -16,6 +16,7 @@ import ast
 import json
 import os
 import re
+import time
 import threading
 import queue
 from collections import Counter
@@ -306,8 +307,11 @@ def get_llm_response(messages: List[Dict], model: str) -> str:
     Returns:
         LLM response text
     """
-    # gpt-5 / o-series use different API params
+    # Select client based on model
+    is_upstage = "solar" in model.lower()
     is_new_api = "gpt-5" in model or model.startswith("o")
+    api_client = eval_client if is_upstage else client
+
     kwargs = {
         "model": model,
         "messages": messages,
@@ -318,7 +322,7 @@ def get_llm_response(messages: List[Dict], model: str) -> str:
     # Retry up to 2 times if empty response
     for attempt in range(3):
         try:
-            response = client.chat.completions.create(**kwargs)
+            response = api_client.chat.completions.create(**kwargs)
             content = response.choices[0].message.content
             if content and content.strip():
                 return content.strip()
@@ -468,19 +472,21 @@ def create_worker_pipelines(base_pipeline: RAGPipeline, n: int) -> List[RAGPipel
     return pipelines
 
 
+def parse_wiki_links(wiki_links_raw) -> List[str]:
+    """Parse wiki_links from dataset item (may be string or list)"""
+    if isinstance(wiki_links_raw, str):
+        try:
+            return ast.literal_eval(wiki_links_raw)
+        except (ValueError, SyntaxError):
+            return []
+    return wiki_links_raw if wiki_links_raw else []
+
+
 def process_single_item(pipeline: RAGPipeline, item: Dict, model: str, verbose: bool) -> Dict:
     """Process a single dataset item through the full RAG pipeline (thread-safe)"""
     index = int(item["Unnamed: 0"])
     question = item["Prompt"]
-    wiki_links_raw = item["wiki_links"]
-
-    if isinstance(wiki_links_raw, str):
-        try:
-            wiki_links = ast.literal_eval(wiki_links_raw)
-        except (ValueError, SyntaxError):
-            wiki_links = []
-    else:
-        wiki_links = wiki_links_raw if wiki_links_raw else []
+    wiki_links = parse_wiki_links(item["wiki_links"])
 
     if verbose:
         print(f"\n[{index}] Processing: {question[:80]}...")
@@ -505,7 +511,200 @@ def process_single_item(pipeline: RAGPipeline, item: Dict, model: str, verbose: 
     return result
 
 
-def main(model: str, start: int = 0, end: int = 100, verbose: bool = False, version: str = "", workers: int = 1):
+def collect_prompts(pipeline: RAGPipeline, item: Dict, model: str, verbose: bool) -> Dict:
+    """Run RAG retrieval only and return prompt messages (no LLM call)"""
+    index = int(item["Unnamed: 0"])
+    question = item["Prompt"]
+    wiki_links = parse_wiki_links(item["wiki_links"])
+    if verbose:
+        print(f"\n[{index}] Collecting prompt: {question[:80]}...")
+    messages = pipeline.get_prompt_messages(question, wiki_links, verbose, model)
+    return {
+        "index": index, "question": question, "messages": messages,
+        "ground_truth": item["Answer"], "reasoning_type": item["reasoning_types"],
+    }
+
+
+def create_batch_jsonl(prompts: List[Dict], model: str, filepath: str):
+    """Create JSONL file for OpenAI Batch API"""
+    is_new_api = "gpt-5" in model or model.startswith("o")
+    with open(filepath, 'w') as f:
+        for p in prompts:
+            if is_new_api:
+                body = {"model": model, "messages": p["messages"], "max_completion_tokens": 2000}
+            else:
+                body = {"model": model, "messages": p["messages"], "max_tokens": 1000, "temperature": 0.3}
+            request = {
+                "custom_id": f"idx-{p['index']}",
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": body,
+            }
+            f.write(json.dumps(request) + '\n')
+    print(f"  Batch JSONL created: {filepath} ({len(prompts)} requests)")
+
+
+def submit_batch(filepath: str) -> str:
+    """Upload file and create batch job, return batch ID"""
+    with open(filepath, "rb") as f:
+        batch_file = client.files.create(file=f, purpose="batch")
+    print(f"  File uploaded: {batch_file.id}")
+    batch = client.batches.create(
+        input_file_id=batch_file.id,
+        endpoint="/v1/chat/completions",
+        completion_window="24h",
+    )
+    print(f"  Batch created: {batch.id}")
+    return batch.id
+
+
+def wait_for_batch(batch_id: str, poll_interval: int = 30) -> str:
+    """Poll batch until completion, return output file ID"""
+    while True:
+        batch = client.batches.retrieve(batch_id)
+        completed = batch.request_counts.completed if batch.request_counts else 0
+        total = batch.request_counts.total if batch.request_counts else 0
+        print(f"  Batch status: {batch.status} ({completed}/{total})")
+        if batch.status == "completed":
+            return batch.output_file_id
+        if batch.status in ("failed", "expired", "cancelled"):
+            if batch.errors:
+                for err in batch.errors.data[:5]:
+                    print(f"    Error: {err.message}")
+            raise RuntimeError(f"Batch {batch.status}: {batch_id}")
+        time.sleep(poll_interval)
+
+
+def download_batch_results(output_file_id: str) -> Dict[str, str]:
+    """Download batch results, return {custom_id: response_text}"""
+    content = client.files.content(output_file_id).text
+    results = {}
+    for line in content.strip().split('\n'):
+        obj = json.loads(line)
+        custom_id = obj["custom_id"]
+        if obj.get("error"):
+            print(f"  Batch error for {custom_id}: {obj['error']}")
+            results[custom_id] = ""
+            continue
+        choices = obj["response"]["body"].get("choices", [])
+        text = choices[0]["message"]["content"] if choices else ""
+        results[custom_id] = text.strip() if text else ""
+    return results
+
+
+def main_batch(model: str, start: int, end: int, verbose: bool, version: str, workers: int):
+    """Batch API mode: 2-pass (retrieval → batch generation → evaluation)"""
+    rag_pipeline = get_rag_pipeline()
+    dataset = load_dataset("google/frames-benchmark", split="test", token=HF_ACCESS_TOKEN)
+    dataset = [item for item in dataset if start <= int(item["Unnamed: 0"]) < end]
+
+    version_suffix = f"_{version}" if version else ""
+    filename = f"evaluation_results_{model.replace('/', '_')}{version_suffix}.json"
+    existing_results = load_existing_results(filename)
+    processed_indices = set(int(r.get("index", -1)) for r in existing_results)
+    items_to_process = [item for item in dataset if int(item["Unnamed: 0"]) not in processed_indices]
+
+    print(f"\n[Batch Mode] Starting evaluation:")
+    print(f"  Model: {model}")
+    print(f"  Range: {start}-{end}")
+    print(f"  Already processed: {len(processed_indices)}")
+    print(f"  Remaining: {len(items_to_process)}")
+    print(f"  Results file: {filename}\n")
+
+    if not items_to_process:
+        print("All items already processed.")
+        return
+
+    # === Pass 1: Collect prompts (RAG retrieval only) ===
+    print("=== Pass 1: RAG Retrieval + Prompt Collection ===")
+    prompts = []
+    if workers > 1:
+        worker_pipelines = create_worker_pipelines(rag_pipeline, workers)
+        pipeline_pool = queue.Queue()
+        for wp in worker_pipelines:
+            pipeline_pool.put(wp)
+
+        def collect_with_pool(item):
+            pipeline = pipeline_pool.get()
+            try:
+                return collect_prompts(pipeline, item, model, verbose)
+            finally:
+                pipeline_pool.put(pipeline)
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(collect_with_pool, item): item for item in items_to_process}
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Collecting prompts"):
+                prompts.append(future.result())
+    else:
+        for item in tqdm(items_to_process, desc="Collecting prompts"):
+            prompts.append(collect_prompts(rag_pipeline, item, model, verbose))
+
+    # Sort by index for consistent ordering
+    prompts.sort(key=lambda p: p["index"])
+    print(f"  Collected {len(prompts)} prompts\n")
+
+    # === Pass 2: Submit batch and wait ===
+    print("=== Pass 2: Batch API Submission ===")
+    jsonl_path = f"batch_input_{model.replace('/', '_')}{version_suffix}.jsonl"
+    create_batch_jsonl(prompts, model, jsonl_path)
+    batch_id = submit_batch(jsonl_path)
+    print(f"  Waiting for batch completion (polling every 30s)...")
+    output_file_id = wait_for_batch(batch_id)
+    batch_results = download_batch_results(output_file_id)
+    print(f"  Received {len(batch_results)} responses\n")
+
+    # === Pass 3: Evaluate responses ===
+    print("=== Pass 3: Evaluation ===")
+    prompt_map = {p["index"]: p for p in prompts}
+    for custom_id, llm_response in tqdm(batch_results.items(), desc="Evaluating"):
+        index = int(custom_id.split("-")[1])
+        p = prompt_map.get(index)
+        if not p:
+            continue
+        if not llm_response:
+            llm_response = "(empty response)"
+        evaluation = evaluate_response(p["question"], llm_response, p["ground_truth"])
+        result = {
+            "index": index,
+            "prompt": p["question"],
+            "ground_truth": p["ground_truth"],
+            "llm_response": llm_response,
+            "evaluation_decision": evaluation["decision"],
+            "evaluation_explanation": evaluation["explanation"],
+            "reasoning_type": p["reasoning_type"],
+        }
+        save_result(filename, result)
+
+    # Cleanup batch input file
+    os.remove(jsonl_path)
+
+    # Print summary (reuse existing logic)
+    results = load_existing_results(filename)
+    range_results = [r for r in results if start <= r.get("index", -1) < end]
+    if not range_results:
+        print("No results to summarize.")
+        return
+    total_samples = len(range_results)
+    correct_answers = sum(1 for r in range_results if r["evaluation_decision"] == "TRUE")
+    accuracy = correct_answers / total_samples
+    print(f"\n{'='*50}")
+    print(f"EVALUATION SUMMARY (Batch Mode)")
+    print(f"{'='*50}")
+    print(f"Model: {model}")
+    print(f"Range: {start}-{end}")
+    print(f"Total samples: {total_samples}")
+    print(f"Correct answers: {correct_answers}")
+    print(f"Accuracy: {accuracy:.2%}")
+    reasoning_types = set(r["reasoning_type"] for r in range_results)
+    print(f"\nAccuracy by reasoning type:")
+    for rt in sorted(reasoning_types):
+        rt_samples = [r for r in range_results if r["reasoning_type"] == rt]
+        rt_correct = sum(1 for r in rt_samples if r["evaluation_decision"] == "TRUE")
+        rt_accuracy = rt_correct / len(rt_samples) if rt_samples else 0
+        print(f"  {rt}: {rt_accuracy:.2%} ({rt_correct}/{len(rt_samples)})")
+
+
+def main(model: str, start: int = 0, end: int = 100, verbose: bool = False, version: str = "", workers: int = 1, batch: bool = False):
     """
     Main evaluation function
 
@@ -516,7 +715,17 @@ def main(model: str, start: int = 0, end: int = 100, verbose: bool = False, vers
         verbose: Whether to print detailed progress
         version: Version suffix for result file
         workers: Number of concurrent workers (1=sequential)
+        batch: Use OpenAI Batch API for generation (50% cost savings)
     """
+    # Batch mode: 2-pass processing
+    if batch:
+        if "solar" in model.lower():
+            print("Error: Batch API is only supported for OpenAI models (gpt-4o-mini, gpt-5-mini).")
+            print("Solar Pro2 uses Upstage API which does not support Batch API.")
+            return
+        main_batch(model, start, end, verbose, version, workers)
+        return
+
     # Initialize RAG pipeline
     rag_pipeline = get_rag_pipeline()
 
@@ -667,6 +876,11 @@ if __name__ == "__main__":
         default=1,
         help="Number of concurrent workers (default: 1, sequential)"
     )
+    parser.add_argument(
+        "--batch",
+        action="store_true",
+        help="Use OpenAI Batch API for generation (50%% cost savings, OpenAI models only)"
+    )
     args = parser.parse_args()
 
-    main(args.model, args.start, args.end, args.verbose, args.version, args.workers)
+    main(args.model, args.start, args.end, args.verbose, args.version, args.workers, args.batch)
