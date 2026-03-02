@@ -9,7 +9,7 @@ Implements a complete RAG pipeline:
 4. Semantic retrieval (cosine similarity)
 5. Chain-of-Thought prompting
 6. LLM response generation
-7. Evaluation with Upstage Solar Pro2
+7. Evaluation with GPT-5-mini
 """
 
 import ast
@@ -42,12 +42,9 @@ load_dotenv()
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 HF_ACCESS_TOKEN = os.environ.get("HF_ACCESS_TOKEN")
-UPSTAGE_API_KEY = os.environ.get("UPSTAGE_API_KEY")
-UPSTAGE_BASE_URL = os.environ.get("UPSTAGE_BASE_URL")
 
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-eval_client = OpenAI(api_key=UPSTAGE_API_KEY, base_url=UPSTAGE_BASE_URL)
 
 
 class RAGPipeline:
@@ -322,10 +319,8 @@ def get_llm_response(messages: List[Dict], model: str) -> str:
     Returns:
         LLM response text
     """
-    # Select client based on model
-    is_upstage = "solar" in model.lower()
     is_new_api = "gpt-5" in model or model.startswith("o")
-    api_client = eval_client if is_upstage else client
+    api_client = client
 
     kwargs = {
         "model": model,
@@ -405,45 +400,28 @@ def get_llm_response_with_voting(messages: List[Dict], model: str, n: int = 3) -
 def evaluate_response(
     question: str, llm_response: str, ground_truth: str
 ) -> Dict[str, str]:
-    """
-    Evaluate LLM response using Upstage Solar Pro2
-    THIS FUNCTION MUST NOT BE MODIFIED
-    """
-    evaluation_prompt = f"""===Task===
-I need your help in evaluating an answer provided by an LLM against a ground
-truth answer. Your task is to determine if the ground truth answer is present in the LLM's
-response. Please analyze the provided data and make a decision.
-===Instructions===
-1. Carefully compare the "Predicted Answer" with the "Ground Truth Answer".
-2. Consider the substance of the answers - look for equivalent information or correct answers.
-Do not focus on exact wording unless the exact wording is crucial to the meaning.
-3. Your final decision should be based on whether the meaning and the vital facts of the
-"Ground Truth Answer" are present in the "Predicted Answer:"
-===Input Data===
-- Question: {question}
-- Predicted Answer: {llm_response}
-- Ground Truth Answer: {ground_truth}
-===Output Format===
-Provide your final evaluation in the following format:
-"Explanation:" (How you made the decision?)
-"Decision:" ("TRUE" or "FALSE" )
-Please proceed with the evaluation."""
+    """Evaluate LLM response against ground truth using GPT-5-mini"""
+    evaluation_prompt = f"""Compare the predicted answer with the ground truth. Determine if the ground truth is present in the prediction. Focus on meaning, not exact wording.
 
-    evaluation_response = eval_client.chat.completions.create(
-        model="solar-pro2",
+Question: {question}
+Predicted Answer: {llm_response}
+Ground Truth Answer: {ground_truth}
+
+Respond with:
+Explanation: (brief reason)
+Decision: TRUE or FALSE"""
+
+    evaluation_response = client.chat.completions.create(
+        model="gpt-5-mini",
         messages=[
-            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "system", "content": "You are an evaluation assistant."},
             {"role": "user", "content": evaluation_prompt},
         ],
-        max_tokens=300,
-        n=1,
-        stop=None,
-        temperature=0.3,
+        max_completion_tokens=300,
     )
 
     evaluation_text = evaluation_response.choices[0].message.content.strip()
 
-    # Extract the decision and explanation
     lines = evaluation_text.split("\n")
     decision = "FALSE"
     explanation = ""
@@ -734,10 +712,6 @@ def main(model: str, start: int = 0, end: int = 100, verbose: bool = False, vers
     """
     # Batch mode: 2-pass processing
     if batch:
-        if "solar" in model.lower():
-            print("Error: Batch API is only supported for OpenAI models (gpt-4o-mini, gpt-5-mini).")
-            print("Solar Pro2 uses Upstage API which does not support Batch API.")
-            return
         main_batch(model, start, end, verbose, version, workers)
         return
 

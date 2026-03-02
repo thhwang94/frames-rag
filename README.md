@@ -12,7 +12,6 @@
 | V11 | gpt-4o-mini | 61% | Source-balanced retrieval + context 확대 |
 | **V12b** | **gpt-5-mini** | **65%** | Anti-refusal + arithmetic check 프롬프트 |
 | V12b | gpt-4o-mini | 64% | V12b 프롬프트 적용 (안정적) |
-| V12b | solar-pro2 | 59% | Upstage Solar Pro2 생성 모델 테스트 |
 
 ## 아키텍처
 
@@ -25,7 +24,7 @@ Wikipedia URL 파싱
   → Blended Reranking (bi-encoder 60% + cross-encoder 40%)
   → Source-balanced Selection (소스별 최소 1청크 보장)
   → LLM Generation (Chain-of-Thought prompting)
-  → Evaluation (Upstage Solar Pro2, LLM-as-a-Judge)
+  → Evaluation (GPT-5-mini, LLM-as-a-Judge)
 ```
 
 ## 프로젝트 구조
@@ -54,8 +53,6 @@ pip install -r requirements.txt
 `.env` 파일에 API 키 설정:
 ```
 OPENAI_API_KEY=sk-...
-UPSTAGE_API_KEY=up-...
-UPSTAGE_BASE_URL=https://api.upstage.ai/v1/solar
 HF_ACCESS_TOKEN=hf_...
 ```
 
@@ -79,7 +76,7 @@ python run.py --model gpt-4o-mini --start 100 --end 200 --version v11
 
 | 옵션 | 설명 | 기본값 |
 |------|------|--------|
-| `--model` | 생성 모델 (gpt-4o-mini, gpt-5-mini, solar-pro2) | gpt-4o-mini |
+| `--model` | 생성 모델 (gpt-4o-mini, gpt-5-mini) | gpt-4o-mini |
 | `--start` | 시작 인덱스 | 0 |
 | `--end` | 종료 인덱스 | 100 |
 | `--workers` | 병렬 워커 수 | 1 |
@@ -104,6 +101,6 @@ Multi-hop QA에서는 여러 위키 문서의 정보를 조합해야 합니다. 
 
 - **Embedding**: BAAI/bge-small-en-v1.5 (sentence-transformers, 로컬)
 - **Reranker**: cross-encoder/ms-marco-MiniLM-L-6-v2
-- **생성 모델**: OpenAI gpt-4o-mini / gpt-5-mini, Upstage solar-pro2
-- **평가 모델**: Upstage Solar Pro2
+- **생성 모델**: OpenAI gpt-4o-mini / gpt-5-mini
+- **평가 모델**: OpenAI GPT-5-mini
 - **Wikipedia**: REST API + BeautifulSoup (비동기 fetch, JSON 캐싱)
